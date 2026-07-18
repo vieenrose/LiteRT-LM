@@ -87,6 +87,7 @@ _SUBCOMMANDS = (
     "toml",
     "system_metadata",
     "llm_metadata",
+    "embedding_metadata",
     "tflite_model",
     "tflite_weights",
     "sp_tokenizer",
@@ -175,6 +176,24 @@ def _add_llm_metadata_parser(subparsers) -> None:
       type=str,
       required=True,
       help="The path to the llm metadata file.",
+  )
+
+
+def _add_embedding_metadata_parser(subparsers) -> None:
+  """Adds a parser for embedding metadata to the subparsers."""
+  embedding_metadata_parser = subparsers.add_parser(
+      "embedding_metadata",
+      description=(
+          "Add embedding metadata to the LiteRT-LM file. Can be a text or"
+          " binary proto file."
+      ),
+      help="Add embedding metadata.",
+  )
+  embedding_metadata_parser.add_argument(
+      "--path",
+      type=str,
+      required=True,
+      help="The path to the embedding metadata file.",
   )
 
 
@@ -328,6 +347,7 @@ def _build_parser() -> argparse.ArgumentParser:
   _add_toml_parser(subparsers)
   _add_system_metadata_parser(subparsers)
   _add_llm_metadata_parser(subparsers)
+  _add_embedding_metadata_parser(subparsers)
   _add_tflite_model_parser(subparsers)
   _add_tflite_weights_parser(subparsers)
   _add_sentencepiece_tokenizer_parser(subparsers)
@@ -439,6 +459,15 @@ def _build_llm_metadata(
   builder.add_llm_metadata(args.path, additional_metadata=metadata)
 
 
+def _build_embedding_metadata(
+    args: argparse.Namespace,
+    builder: litertlm_builder.LitertLmFileBuilder,
+) -> None:
+  """Builds embedding metadata from the parsed arguments."""
+  metadata = _get_metadata_from_args(args)
+  builder.add_embedding_metadata(args.path, additional_metadata=metadata)
+
+
 def _build_tflite_model(
     args: argparse.Namespace,
     builder: litertlm_builder.LitertLmFileBuilder,
@@ -535,6 +564,8 @@ def _build_litertlm_file(parsed_args: list[argparse.Namespace]) -> None:
           _build_system_metadata(parsed_arg, builder)
         case "llm_metadata":
           _build_llm_metadata(parsed_arg, builder)
+        case "embedding_metadata":
+          _build_embedding_metadata(parsed_arg, builder)
         case "tflite_model":
           _build_tflite_model(parsed_arg, builder)
         case "tflite_weights":
