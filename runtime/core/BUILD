@@ -368,7 +368,6 @@ cc_library(
         "//runtime/components/logits_processor:repetition_penalty_processor",
         "//runtime/components/logits_processor:suppress_tokens_config",
         "//runtime/components/logits_processor:suppress_tokens_processor",
-        "//runtime/components/logits_processor/constrained_decoding:bitmap",
         "//runtime/components/logits_processor/constrained_decoding:constrained_decoder",
         "//runtime/components/logits_processor/constrained_decoding:constraint",
         "//runtime/components/logits_processor/constrained_decoding:thinking_budget_constraint",
@@ -489,5 +488,35 @@ cc_test(
         "//runtime/executor:fake_llm_executor",
         "//runtime/executor:llm_executor_io_types",
         "//runtime/framework/resource_management:threaded_execution_manager",
+    ],
+)
+
+cc_test(
+    name = "embedding_engine_impl_test",
+    srcs = ["embedding_engine_impl_test.cc"],
+    data = [
+        "//runtime/testdata:test_embedding.litertlm",
+        "//runtime/testdata:test_lm.litertlm",
+    ],
+    deps = [
+        ":embedding_engine_impl",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@litert//litert/cc:litert_environment",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_model",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//support/tokenizer",
+        "//runtime/components:model_resources",
+        "//runtime/components:model_resources_litert_lm",
+        "//runtime/engine:embedding_engine",
+        "//runtime/engine:embedding_engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/executor:executor_settings_base",
+        "//runtime/util:litert_lm_loader",
+        "//runtime/util:litert_util",
+        "//runtime/util:scoped_file",
     ],
 )
