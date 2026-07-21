@@ -27,6 +27,13 @@ BAZEL_BIN=$(bazelisk info bazel-bin)
 WHEEL_DIR="${BAZEL_BIN}/python/litert_lm_cli"
 rm -rf "${WHEEL_DIR}"
 
+# Authenticate gcloud using the Kokoro keystore if available
+if [[ -n "${KOKORO_KEYSTORE_DIR:-}" && -f "${KOKORO_KEYSTORE_DIR}/75272_litert_lm_api_gcs_service_account.json" ]]; then
+  echo "Authenticating gcloud with service account..."
+  export GOOGLE_APPLICATION_CREDENTIALS="${KOKORO_KEYSTORE_DIR}/75272_litert_lm_api_gcs_service_account.json"
+  gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" || true
+fi
+
 # Determine which API wheels to fetch from GCS based on the release mode
 API_WHEELS_GCS_DIR="gs://litert-lm-api/macos/nightly_wheels"
 API_PREFIX="litert_lm_api_nightly"
@@ -46,7 +53,7 @@ else
   
   # Temporarily disable exit-on-error for the ls command
   set +e
-  LATEST_WHEEL_PATH=$(gsutil ls "${API_WHEELS_GCS_DIR}/${API_PREFIX}-*.whl" | sort | tail -n 1)
+  LATEST_WHEEL_PATH=$(gcloud storage ls --sort-by="~updated" --limit=1 "${API_WHEELS_GCS_DIR}/${API_PREFIX}-*.whl" 2>/dev/null | head -n 1 || true)
   set -e
   
   if [[ -n "${LATEST_WHEEL_PATH}" ]]; then
@@ -81,7 +88,7 @@ echo "Detected CLI Version: ${CLI_VERSION}"
 
 # 3. Download the exact matching API wheels
 echo "Downloading API wheels for version ${CLI_VERSION}..."
-gsutil cp "${API_WHEELS_GCS_DIR}/${API_PREFIX}-${CLI_VERSION}*.whl" "${API_WHEELS_DIR}/" || true
+gcloud storage cp "${API_WHEELS_GCS_DIR}/${API_PREFIX}-${CLI_VERSION}*.whl" "${API_WHEELS_DIR}/" || true
 
 if ! ls "${API_WHEELS_DIR}"/*.whl > /dev/null 2>&1; then
   echo "❌ Failed to find matching API wheels in GCS for version ${CLI_VERSION}!"
