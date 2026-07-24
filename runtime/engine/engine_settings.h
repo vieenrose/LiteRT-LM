@@ -15,11 +15,13 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_SETTINGS_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_SETTINGS_H_
 
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"  // from @com_google_absl
@@ -182,6 +184,8 @@ std::ostream& operator<<(std::ostream& os, const EngineSettings& settings);
 // Configurations used for the session.
 // This class encapsulates the session-specific configurations that are used for
 // creating a LiteRT LM session.
+class ExecutorAudioData;
+
 class SessionConfig {
  public:
   // Creates a default SessionConfig.
@@ -277,6 +281,14 @@ class SessionConfig {
     max_output_tokens_ = max_output_tokens;
   }
 
+  using AudioEmbeddingsCallback = std::function<void(const ExecutorAudioData&)>;
+  const AudioEmbeddingsCallback& GetAudioEmbeddingsCallback() const {
+    return audio_embeddings_callback_;
+  }
+  void SetAudioEmbeddingsCallback(AudioEmbeddingsCallback callback) {
+    audio_embeddings_callback_ = std::move(callback);
+  }
+
  private:
   // Private constructor for the SessionConfig. The user should use the
   // CreateDefault() method to create a SessionConfig.
@@ -339,6 +351,8 @@ class SessionConfig {
   // tokens (input + output) stored in the KV cache over the lifetime of a
   // session.
   int max_output_tokens_ = std::numeric_limits<int>::max();
+
+  AudioEmbeddingsCallback audio_embeddings_callback_;
 };
 
 std::ostream& operator<<(std::ostream& os, const SessionConfig& config);
