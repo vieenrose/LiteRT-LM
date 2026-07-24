@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: "CI-Win"
+name: "[Deprecated] CI-Win"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -20,14 +20,10 @@ concurrency:
 
 jobs:
   presubmit:
-    name: "Presubmit-Win"
-    runs-on: Windows_x64
+    name: "[Deprecated] Presubmit-Win"
     defaults:
       run:
         shell: pwsh
-    permissions:
-      actions: write  # For gh cache delete.
-      contents: write  # For gh release upload.
     env:
       MODEL_KEY: gemma-3-1b-it-v1
       MODEL_PATH: .\models\gemma3-1b-it-int4.litertlm
@@ -40,6 +36,11 @@ jobs:
       REFRESH_CACHE: ${{ github.event_name == 'schedule' ||
                          (github.event_name == 'workflow_dispatch' && inputs.REFRESH_CACHE) }}
     steps:
+      - name: Deprecated workflow.
+        run: |
+          Write-Host "This workflow is deprecated."
+          exit 1
+
       - name: Checkout code.
         uses: actions/checkout@v4
         with:
@@ -124,9 +125,6 @@ jobs:
             --build_tag_filters='-nowindows' `
             //... `
             //runtime/engine:litert_lm_main
-
-
-
 
       - name: Update litert_lm_main prebuilt for Windows if new version tag is pushed.
         if: github.ref_type == 'tag'
