@@ -17,14 +17,22 @@
 cmake_minimum_required(VERSION 3.25 FATAL_ERROR)
 project(LiteRT-LM-Orchestrator LANGUAGES NONE)
 
-if(NOT DEFINED LITERTLM_HOST_PROTOC)
-    set(LITERTLM_HOST_PROTOC "${CMAKE_CURRENT_BINARY_DIR}/prebuild/build/external/protobuf/install/bin/protoc")
-    set(LITERTLM_HOST_PROTOC_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/prebuild/build/external/protobuf/install/bin")
-endif()
+# These point into the prebuild/ tree, which only the host prebuild phase below creates — and
+# that phase runs solely when LITERTLM_TOOLCHAIN_ARGS is set (cross-compiling). Defining them
+# unconditionally left a native build with a HOST_FLATC that is never built, and
+# flatbuffers.cmake prefers it over the flatc it just compiled, so the schema step failed with
+# "No such file or directory". Define them only when the phase that produces them will run; a
+# caller can still pass either explicitly.
+if(LITERTLM_TOOLCHAIN_ARGS)
+    if(NOT DEFINED LITERTLM_HOST_PROTOC)
+        set(LITERTLM_HOST_PROTOC "${CMAKE_CURRENT_BINARY_DIR}/prebuild/build/external/protobuf/install/bin/protoc")
+        set(LITERTLM_HOST_PROTOC_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/prebuild/build/external/protobuf/install/bin")
+    endif()
 
-if(NOT DEFINED LITERTLM_HOST_FLATC)
-    set(LITERTLM_HOST_FLATC "${CMAKE_CURRENT_BINARY_DIR}/prebuild/build/external/flatbuffers/install/bin/flatc")
-    set(LITERTLM_HOST_FLATC_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/prebuild/build/external/flatbuffers/install/bin")
+    if(NOT DEFINED LITERTLM_HOST_FLATC)
+        set(LITERTLM_HOST_FLATC "${CMAKE_CURRENT_BINARY_DIR}/prebuild/build/external/flatbuffers/install/bin/flatc")
+        set(LITERTLM_HOST_FLATC_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/prebuild/build/external/flatbuffers/install/bin")
+    endif()
 endif()
 
 include(ExternalProject)

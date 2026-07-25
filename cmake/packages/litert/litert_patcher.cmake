@@ -114,9 +114,14 @@ patch_file_content("${LITERT_SRC_DIR}/cc/internal/litert_runtime_builtin.cc"
 )
 
 file(READ "${LITERT_PACKAGE_DIR}/shims/litert_cc_options_shim.cmake" litert_cc_options_shim_CONTENT)
+# The shim content MUST be quoted: unquoted, a whole file's worth of text expands into many
+# arguments (CMake splits on spaces, newlines and semicolons), so patch_file_content received
+# only its first token as the replacement and TRUE landed in the wrong parameter. The shim
+# therefore never reached cc/options/CMakeLists.txt, litert_cc_options was never defined, and
+# linking libLiteRt.so died on "cannot find -llitert_cc_options".
 patch_file_content("${LITERT_SRC_DIR}/cc/options/CMakeLists.txt"
     "cmake_minimum_required\\(VERSION 3.20\\).*"
-    ${litert_cc_options_shim_CONTENT}
+    "${litert_cc_options_shim_CONTENT}"
     TRUE
 )
 
