@@ -15,7 +15,8 @@
 
 set(PKG_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_subdirectory(constrained_decoding)
+# Upstream path bug: the package lives under logits_processor/, not here.
+add_subdirectory(logits_processor/constrained_decoding)
 add_subdirectory(embedding_lookup)
 add_subdirectory(preprocessor)
 add_subdirectory(tool_use)

@@ -26,9 +26,11 @@ foreach(FBS_FILE ${FBS_FILES})
     execute_process(
         COMMAND ${FLATC_BIN} --cpp --gen-object-api --reflect-names --gen-mutable -o "${FBS_DIR}" "${FBS_FILE}"
         RESULT_VARIABLE RET_CODE
+        OUTPUT_VARIABLE FLATC_OUT
+        ERROR_VARIABLE FLATC_ERR
     )
 
     if(NOT RET_CODE EQUAL 0)
-        message(FATAL_ERROR "Failed to compile ${FBS_FILE}")
+        message(FATAL_ERROR "Failed to compile ${FBS_FILE}\n  flatc: ${FLATC_BIN}\n  rc=${RET_CODE}\n  stdout: ${FLATC_OUT}\n  stderr: ${FLATC_ERR}")
     endif()
 endforeach()
