@@ -113,6 +113,15 @@ patch_file_content("${LITERT_SRC_DIR}/cc/internal/litert_runtime_builtin.cc"
     FALSE
 )
 
+# LiteRT-LM's runtime/components headers include "support/tokenizer/tokenizer.h" // from @litert,
+# but the pinned LiteRT revision predates that subtree — the fetched tree has no support/ at all,
+# so a native build fails with "No such file or directory". Install the two headers it needs into
+# the source root, which is on LITERT_INCLUDE_PATHS. See vendored/README.md.
+if(NOT EXISTS "${LITERT_SOURCE_DIR}/support/tokenizer/tokenizer.h")
+    message(STATUS "[LiteRTLM] Installing vendored LiteRT support/ headers...")
+    file(COPY "${LITERT_PACKAGE_DIR}/vendored/support" DESTINATION "${LITERT_SOURCE_DIR}")
+endif()
+
 file(READ "${LITERT_PACKAGE_DIR}/shims/litert_cc_options_shim.cmake" litert_cc_options_shim_CONTENT)
 # The shim content MUST be quoted: unquoted, a whole file's worth of text expands into many
 # arguments (CMake splits on spaces, newlines and semicolons), so patch_file_content received
