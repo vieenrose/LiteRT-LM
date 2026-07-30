@@ -40,9 +40,12 @@ extern "C" {
 
 typedef struct tq3_attn_core tq3_attn_core;
 
-/* ctxs must outlive the core. threads<=0 = use OMP default. */
+/* ctxs must outlive the core. threads<=0 = use OMP default.
+ * global_mode: 0 = full fp32 memo (default), 1 = fp16 memo, 2 = stream
+ * (no persistent global-layer memo; decode = O(1) tile streaming,
+ * bit-identical to full). Sliding layers always use the fp32 window memo. */
 tq3_attn_core *tq3_attn_create(const tq3_ctx *tq256, const tq3_ctx *tq512,
-                               int threads);
+                               int threads, int global_mode);
 void tq3_attn_destroy(tq3_attn_core *core);
 
 /* Bump before every interpreter Run whose packed caches may have changed. */

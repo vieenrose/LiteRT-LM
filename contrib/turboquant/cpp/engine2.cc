@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <chrono>
 #include <map>
@@ -58,12 +59,26 @@
 
 namespace {
 
-constexpr int kCacheLen = 16384;
-constexpr int kNumLayers = 15;
+int kCacheLen = 16384;   // runtime: --cache-len (4k device export uses 4096)
+constexpr int kMaxLayers = 64;
+int kNumLayers = 15;     // --layers  (E2B 15 ext pairs, Gemma-3-1B 26)
 constexpr int kPrefill = 128;
-constexpr int kWindow = 512;
-bool is_global_layer(int l) { return l == 4 || l == 9 || l == 14; }
-int layer_dim(int l) { return is_global_layer(l) ? 512 : 256; }
+int kWindow = 512;       // --window
+int kGlobalEvery = 5;    // --global-every (E2B 5 -> 4,9,14; G3-1B 6 -> 5,11,17,23)
+int kGlobalDim = 512;    // --global-dim (G3-1B head_dim is 256 everywhere)
+bool is_global_layer(int l) { return (l + 1) % kGlobalEvery == 0; }
+int layer_dim(int l) { return is_global_layer(l) ? kGlobalDim : 256; }
+
+// Windowed side-cache: a sliding-window layer can never attend outside its last
+// kWindow positions, so its ring buffer only needs kWindow rows (absolute
+// column c lives at c % kWindow).  Global layers keep the full cache length --
+// windowing those WOULD lose information.  --window-kv 0 disables (full length
+// everywhere, the original layout).
+bool kWindowKv = false;
+int layer_rows(int l) {
+  return (kWindowKv && !is_global_layer(l) && kWindow < kCacheLen) ? kWindow
+                                                                  : kCacheLen;
+}
 
 double now_s() {
   using namespace std::chrono;
@@ -311,34 +326,234 @@ struct Component {
   }
 };
 
-// ---------------- PLE (mmap'd bf16 row gather) -------------------------------
+// ---------------- PLE --------------------------------------------------------
+// Two sources:
+//  * ple.json  : mmap model.safetensors at the recorded offset (bf16, desktop)
+//  * --ple-table FILE : standalone table (make_ple_table.py), 32-byte header
+//    "PLETBL01" + u32 dtype(0=fp32,1=fp16,2=bf16,3=int8,4=int4) + u32 rows +
+//    u32 cols + f32 scale + 8 pad. dtype>=3: cols f32 per-column quant scales
+//    follow the header, then rows*cols int8 values (dtype 3) or rows*cols/2
+//    bytes of little-nibble-first int4 (dtype 4, signed [-8,7]).
+//    Dequant: value * colscale[c] * scale. bf16 is bit-identical to
+//    the safetensors path; fp16 loses only sub-normal-range values.
+static inline float half_to_float(uint16_t h) {
+  uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+  uint32_t exp = (h >> 10) & 0x1f;
+  uint32_t man = h & 0x3ff;
+  uint32_t bits;
+  if (exp == 0) {
+    if (man == 0) { bits = sign; }
+    else {                       // subnormal half -> normalized float
+      int sh = 0; while (!(man & 0x400)) { man <<= 1; ++sh; }
+      man &= 0x3ff;
+      bits = sign | ((127 - 15 - sh + 1) << 23) | (man << 13);
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7f800000u | (man << 13);
+  } else {
+    bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
+  }
+  float f; memcpy(&f, &bits, 4); return f;
+}
+
+
+// ---- page-cache footprint control ------------------------------------------
+// Apply |advice| to every mapping whose backing path contains |needle|.
+// LiteRT/XNNPACK own the model and weight-cache mmaps, so /proc/self/maps is
+// the only handle we have on them.
+static size_t madvise_mapped_file(const char* needle, int advice) {
+  FILE* f = fopen("/proc/self/maps", "r");
+  if (!f) return 0;
+  char line[512]; size_t total = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (!strstr(line, needle)) continue;
+    unsigned long lo = 0, hi = 0;
+    if (sscanf(line, "%lx-%lx", &lo, &hi) != 2 || hi <= lo) continue;
+    if (madvise((void*)lo, hi - lo, advice) == 0) total += hi - lo;
+  }
+  fclose(f);
+  return total;
+}
+
+// Periodically drop the weight pages already streamed through.  The weight set
+// is read in full every token and dwarfs the reclaimable RAM of a small device,
+// so those pages have no reuse value -- but they keep counting toward RSS,
+// which is what Android's lowmemorykiller ranks victims by.  Clean file pages:
+// dropping is always safe and costs only a refault we would have taken anyway.
+static void trim_file_cache() {
+  madvise_mapped_file(".tflite", MADV_DONTNEED);
+  madvise_mapped_file("wcache", MADV_DONTNEED);
+}
+
+// One-shot: after the graph is built and (with a warm XNNPACK weight cache)
+// the repacked weights are being served from wcache, the pages faulted in from
+// the .tflite during construction are dead weight that still counts toward RSS
+// -- and RSS is what Android's lowmemorykiller ranks victims by.  Measured on a
+// Boox Tab Mini C (Gemma 4 E2B): this returns 2196 MB.  Clean MAP_PRIVATE file
+// pages, so dropping is always safe; anything still needed simply refaults.
+// TQ3_DROP_MODEL_CACHE=0 disables.
+static void drop_model_page_cache() {
+  const char* e = getenv("TQ3_DROP_MODEL_CACHE");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) return;
+  size_t n = madvise_mapped_file(".tflite", MADV_DONTNEED);
+  fprintf(stderr, "dropped %.0f MB of .tflite page cache from RSS\n",
+          n / 1048576.0);
+}
+
+// Whole-process resident split from smaps_rollup, in kB.
+static void rollup_kb(long* rss, long* anon) {
+  *rss = *anon = 0;
+  FILE* f = fopen("/proc/self/smaps_rollup", "r");
+  if (!f) return;
+  char line[256]; long v;
+  while (fgets(line, sizeof line, f)) {
+    if (sscanf(line, "Rss: %ld", &v) == 1) *rss = v;
+    else if (sscanf(line, "Anonymous: %ld", &v) == 1) *anon = v;
+  }
+  fclose(f);
+}
+
+static int g_trim_every = -1;
+static int g_since_trim = 0;
+static long g_peak_file_kb = 0, g_peak_rss_kb = 0;
+static void maybe_trim() {
+  if (g_trim_every < 0) {
+    const char* e = getenv("TQ3_TRIM_EVERY");
+    g_trim_every = e ? atoi(e) : 0;
+  }
+  long rss, anon; rollup_kb(&rss, &anon);
+  if (rss > g_peak_rss_kb) g_peak_rss_kb = rss;
+  if (rss - anon > g_peak_file_kb) g_peak_file_kb = rss - anon;
+  if (g_trim_every > 0 && ++g_since_trim >= g_trim_every) {
+    g_since_trim = 0;
+    trim_file_cache();
+  }
+}
+
 struct Ple {
-  const uint16_t* base = nullptr;  // bf16 rows
+  const uint8_t* base = nullptr;
   size_t map_len = 0; void* map_addr = nullptr;
   long rows = 0, cols = 0; float scale = 16.0f;
-  void init(const std::string& meta_path) {
-    std::string j = slurp(meta_path);
-    std::string path = json_str(j, "path");
-    long off = json_long(j, "offset");
-    rows = json_long(j, "rows"); cols = json_long(j, "cols");
-    int fd = open(path.c_str(), O_RDONLY);
+  int dtype = 2;  // 0 fp32, 1 fp16, 2 bf16, 3 int8+colscale, 4 int4+colscale
+  std::vector<float> colscale;  // per-column scale * global scale (dtype>=3)
+  // I/O strategy for the row gather.  A gather touches one ~8.75 KB row per
+  // token at a uniformly random offset in a multi-GiB table.  Under mmap the
+  // kernel's default readahead pulls 128 KB+ per fault and every page stays
+  // resident, so the mapping's RSS grows toward the whole table for no reuse
+  // benefit -- fatal on memory-tight devices, where it makes the process the
+  // fattest lowmemorykiller target.  pread() copies just the row into a
+  // reusable buffer and never grows RSS.  TQ3_PLE_IO_PREAD=0 restores mmap.
+  bool use_pread = true;
+  int fd = -1; size_t row_bytes = 0; off_t data_off = 0;
+  mutable std::vector<uint8_t> rowbuf;
+  ~Ple() { if (map_addr) munmap(map_addr, map_len); if (fd >= 0) close(fd); }
+  void map_file(const std::string& path, long off) {
+    fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) DIE("open %s", path.c_str());
     struct stat st; fstat(fd, &st);
     map_len = st.st_size;
+    data_off = (off_t)off;
+    const char* e = getenv("TQ3_PLE_IO_PREAD");
+    use_pread = !(e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N'));
+    if (use_pread) return;  // no mapping at all in pread mode
     map_addr = mmap(nullptr, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map_addr == MAP_FAILED) DIE("mmap %s", path.c_str());
-    close(fd);
-    base = (const uint16_t*)((const uint8_t*)map_addr + off);
+    // Random row gather: suppress readahead, which otherwise inflates this
+    // mapping's resident set by ~15x for no benefit.
+    madvise(map_addr, map_len, MADV_RANDOM);
+    base = (const uint8_t*)map_addr + off;
+  }
+  // Raw bytes of row |tok|.  Under mmap this points into the mapping; under
+  // pread into the reusable buffer, valid until the next call.  Identical
+  // bytes either way.
+  const uint8_t* row_ptr(int32_t tok) const {
+    size_t r = (size_t)(tok < 0 ? 0 : (tok >= rows ? rows - 1 : tok));
+    if (!use_pread) return base + r * row_bytes;
+    off_t off = data_off + (off_t)r * (off_t)row_bytes;
+    size_t got = 0;
+    while (got < row_bytes) {
+      ssize_t n = pread(fd, rowbuf.data() + got, row_bytes - got,
+                        off + (off_t)got);
+      if (n > 0) got += (size_t)n;
+      else if (n < 0 && errno == EINTR) continue;
+      else { memset(rowbuf.data() + got, 0, row_bytes - got); break; }
+    }
+    return rowbuf.data();
+  }
+  void set_row_bytes() {
+    row_bytes = dtype == 0 ? (size_t)cols * 4
+              : dtype <= 2 ? (size_t)cols * 2
+              : dtype == 3 ? (size_t)cols : (size_t)cols / 2;
+    rowbuf.resize(row_bytes);
+  }
+  void init(const std::string& meta_path) {
+    std::string j = slurp(meta_path);
+    long off = json_long(j, "offset");
+    rows = json_long(j, "rows"); cols = json_long(j, "cols");
+    dtype = 2;
+    map_file(json_str(j, "path"), off);
+    set_row_bytes();
+  }
+  void init_table(const std::string& path) {
+    struct { char magic[8]; uint32_t dtype, rows, cols; float scale;
+             char pad[8]; } hdr;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f || fread(&hdr, sizeof hdr, 1, f) != 1) DIE("read %s", path.c_str());
+    fclose(f);
+    if (memcmp(hdr.magic, "PLETBL01", 8)) DIE("%s: bad magic", path.c_str());
+    dtype = (int)hdr.dtype; rows = hdr.rows; cols = hdr.cols; scale = hdr.scale;
+    size_t extra = dtype >= 3 ? (size_t)cols * 4 : 0;
+    size_t data_bytes = dtype == 0 ? (size_t)rows * cols * 4
+                      : dtype <= 2 ? (size_t)rows * cols * 2
+                      : dtype == 3 ? (size_t)rows * cols
+                      : (size_t)rows * (cols / 2);
+    map_file(path, (long)(sizeof hdr + extra));
+    set_row_bytes();
+    if (map_len < sizeof hdr + extra + data_bytes)
+      DIE("%s: truncated", path.c_str());
+    if (dtype >= 3) {
+      std::vector<float> cs(cols);
+      if (pread(fd, cs.data(), (size_t)cols * 4, sizeof hdr) !=
+          (ssize_t)((size_t)cols * 4))
+        DIE("%s: colscale read", path.c_str());
+      colscale.resize(cols);
+      for (long c = 0; c < cols; ++c) colscale[c] = cs[c] * scale;
+    }
+    static const char* dn[] = {"fp32", "fp16", "bf16", "int8", "int4"};
+    fprintf(stderr, "PLE table %s: dtype=%s rows=%ld cols=%ld scale=%g\n",
+            path.c_str(), dn[dtype], rows, cols, scale);
   }
   // dst: n_tok * cols floats (cols = 35*256)
   void gather(const int32_t* toks, int n_tok, float* dst) const {
     for (int t = 0; t < n_tok; ++t) {
-      const uint16_t* row = base + (size_t)toks[t] * cols;
       float* d = dst + (size_t)t * cols;
-      for (long c = 0; c < cols; ++c) {
-        uint32_t bits = (uint32_t)row[c] << 16;
-        float v; memcpy(&v, &bits, 4);
-        d[c] = v * scale;
+      const uint8_t* raw = row_ptr(toks[t]);
+      if (dtype == 0) {
+        const float* row = (const float*)raw;
+        for (long c = 0; c < cols; ++c) d[c] = row[c] * scale;
+      } else if (dtype == 3) {
+        const int8_t* row = (const int8_t*)raw;
+        for (long c = 0; c < cols; ++c) d[c] = (float)row[c] * colscale[c];
+      } else if (dtype == 4) {
+        const uint8_t* row = raw;
+        for (long c = 0; c < cols; c += 2) {
+          uint8_t b = row[c >> 1];
+          int lo = (int)(int8_t)(uint8_t)(b << 4) >> 4;
+          int hi = (int)(int8_t)b >> 4;
+          d[c] = (float)lo * colscale[c];
+          d[c + 1] = (float)hi * colscale[c + 1];
+        }
+      } else {
+        const uint16_t* row = (const uint16_t*)raw;
+        if (dtype == 1) {
+          for (long c = 0; c < cols; ++c) d[c] = half_to_float(row[c]) * scale;
+        } else {
+          for (long c = 0; c < cols; ++c) {
+            uint32_t bits = (uint32_t)row[c] << 16;
+            float v; memcpy(&v, &bits, 4);
+            d[c] = v * scale;
+          }
+        }
       }
     }
   }
@@ -354,39 +569,71 @@ struct Engine {
   bool use_tq = true;
   bool fused = false;   // model consumes packed_* inputs via the custom op
   // packed side-cache: [layer][2(k,v)] -> kCacheLen * block_bytes
-  std::vector<uint8_t> packed[kNumLayers][2];
+  std::vector<uint8_t> packed[kMaxLayers][2];
   std::map<std::string, std::pair<void*, size_t>> ext_inputs;
   double t_model = 0, t_quant = 0, t_dequant = 0, t_glue = 0;
 
   int attn_threads = 8;   // OMP threads for the fused kernel; more
                         // collides with the XNNPACK pool (oversubscription)
+  int global_memo = 0;    // 0 full fp32, 1 fp16, 2 stream (see tq3_attn.h)
+  int kv_bits = 3;       // --kv-bits (3 = TQ3, 4 = TQ4)
+  bool has_ple = true;
+  std::string ple_table;  // optional standalone PLE table (--ple-table)
   void init(const std::string& model_path, const std::string& final_dir,
             const std::string& assets, int threads,
             const std::string& weight_cache, bool tq_mode) {
     use_tq = tq_mode;
     ENSURE(LiteRtCreateEnvironment(0, nullptr, &env));
-    if (tq3_init(&tq256, 256, (assets + "/rot_d256.bin").c_str(),
-                 (assets + "/cb_d256_b3.bin").c_str()))
-      DIE("tq3_init d=256");
-    if (tq3_init(&tq512, 512, (assets + "/rot_d512.bin").c_str(),
-                 (assets + "/cb_d512_b3.bin").c_str()))
-      DIE("tq3_init d=512");
-    if (use_tq)
+    if (kv_bits == 16) {              // exact fp16: no rotation, no codebook
+      if (tq3_init(&tq256, 256, 16, nullptr, nullptr) ||
+          tq3_init(&tq512, 512, 16, nullptr, nullptr))
+        DIE("tq3_init fp16");
+      fprintf(stderr, "KV codec: EXACT fp16, block %zu B at d=256\n",
+              tq256.block_bytes);
+    } else {
+      char cb[512];
+      snprintf(cb, sizeof cb, "%s/cb_d256_b%d.bin", assets.c_str(), kv_bits);
+      if (tq3_init(&tq256, 256, kv_bits, (assets + "/rot_d256.bin").c_str(), cb))
+        DIE("tq3_init d=256 bits=%d (%s)", kv_bits, cb);
+      snprintf(cb, sizeof cb, "%s/cb_d512_b%d.bin", assets.c_str(), kv_bits);
+      if (tq3_init(&tq512, 512, kv_bits, (assets + "/rot_d512.bin").c_str(), cb))
+        DIE("tq3_init d=512 bits=%d (%s)", kv_bits, cb);
+      fprintf(stderr, "KV codec: %d-bit TurboQuant, block %zu B at d=256\n",
+              kv_bits, tq256.block_bytes);
+    }
+    if (use_tq) {
+      size_t kv_total = 0;
       for (int l = 0; l < kNumLayers; ++l) {
-        size_t bb = (is_global_layer(l) ? tq512 : tq256).block_bytes;
+        size_t bb = (layer_dim(l) == 512 ? tq512 : tq256).block_bytes;
+        const size_t rows = (size_t)layer_rows(l);
         // +64: LiteRT host-memory buffers require 64-byte alignment
-        packed[l][0].assign((size_t)kCacheLen * bb + 64, 0);
-        packed[l][1].assign((size_t)kCacheLen * bb + 64, 0);
+        packed[l][0].assign(rows * bb + 64, 0);
+        packed[l][1].assign(rows * bb + 64, 0);
+        kv_total += 2 * rows * bb;
         for (int role = 0; role < 2; ++role)
           ext_inputs[std::string("packed_") + (role ? "v" : "k") + "_" +
-                     std::to_string(l)] = {pdata(l, role), (size_t)kCacheLen * bb};
+                     std::to_string(l)] = {pdata(l, role), rows * bb};
       }
-    attn = tq3_attn_create(&tq256, &tq512, attn_threads);
+      fprintf(stderr,
+              "KV side-cache: %.1f MB (%d layers, window-kv %s, %d sliding at "
+              "%d rows / %d global at %d rows)\n",
+              kv_total / 1048576.0, kNumLayers, kWindowKv ? "on" : "off",
+              kNumLayers - kNumLayers / kGlobalEvery, layer_rows(0),
+              kNumLayers / kGlobalEvery, kCacheLen);
+    }
+    attn = tq3_attn_create(&tq256, &tq512, attn_threads, global_memo);
     model = new Component(env, model_path, threads, weight_cache,
                           /*alias_kv=*/true, &ext_inputs, attn);
     aux = new Component(env, final_dir + "/auxiliary.tflite", threads, "", false);
     emb = new Component(env, final_dir + "/embedder_quantized.tflite", threads, "", false);
-    ple.init(assets + "/ple.json");
+    has_ple = model->sig("decode").in_idx("per_layer_embeddings") >= 0;
+    if (has_ple) {
+      if (!ple_table.empty()) ple.init_table(ple_table);
+      else ple.init(assets + "/ple.json");
+    } else {
+      fprintf(stderr, "no per_layer_embeddings input: PLE disabled (dense model)"
+              "\n");
+    }
     fused = model->sig("decode").in_idx("packed_k_0") >= 0;
     if (fused && !use_tq) DIE("fused model has no baseline mode");
     fprintf(stderr, "model %s: %s mode\n", model_path.c_str(),
@@ -414,7 +661,7 @@ struct Engine {
       const char role = nm[9];              // 'k' or 'v'
       const int layer = atoi(nm.c_str() + 11);
       const int d = layer_dim(layer);
-      tq3_ctx* q = is_global_layer(layer) ? &tq512 : &tq256;
+      tq3_ctx* q = layer_dim(layer) == 512 ? &tq512 : &tq256;
       const float* s = (const float*)Component::lock_r(io.out[oi]);
       LiteRtTensorBuffer cb = nullptr;
       float* dst = nullptr;
@@ -433,7 +680,9 @@ struct Engine {
         }
         const float* w = vec;
         if (use_tq) {
-          uint8_t* blk = pdata(layer, role == 'v') + (size_t)pos * q->block_bytes;
+          const int rws = layer_rows(layer);
+          uint8_t* blk = pdata(layer, role == 'v') +
+                         (size_t)(pos % rws) * q->block_bytes;
           double t0 = now_s();
           tq3_quantize(q, vec, blk, scr);   // quantize-on-write; packed = truth
           t_quant += now_s() - t0;
@@ -468,13 +717,15 @@ struct Engine {
   float verify_packed(int layer, int lo, int hi) {
     if (!use_tq || fused) return -1.f;
     const int d = layer_dim(layer);
-    tq3_ctx* q = is_global_layer(layer) ? &tq512 : &tq256;
+    tq3_ctx* q = layer_dim(layer) == 512 ? &tq512 : &tq256;
     float deq[512], m = 0.f;
     for (int role = 0; role < 2; ++role) {
       std::string nm = std::string("kv_cache_") + (role ? "v" : "k") + "_" + std::to_string(layer);
       const float* stg = (const float*)Component::lock_r(model->alias_.at(nm));
       for (int pos = lo; pos < hi; ++pos) {
-        tq3_dequantize(q, pdata(layer, role) + (size_t)pos * q->block_bytes, deq);
+        tq3_dequantize(q, pdata(layer, role) +
+                              (size_t)(pos % layer_rows(layer)) * q->block_bytes,
+                       deq);
         for (int j = 0; j < d; ++j) {
           float sv = role ? stg[(size_t)j * kCacheLen + pos] : stg[(size_t)pos * d + j];
           float diff = fabsf(sv - deq[j]);
@@ -530,6 +781,7 @@ struct Engine {
     if (o < 0 || mi < 0) DIE("embeddings io");
     Component::copy_buf(esig.out[o], target.in[mi],
                         Component::buf_bytes(target.in[mi]));
+    if (!has_ple) return;
     int pl = target.in_idx("per_layer_embeddings");
     if (pl < 0) DIE("ple input");
     float* p = (float*)Component::lock_w(target.in[pl]);
@@ -608,8 +860,11 @@ struct Engine {
 
 int main(int argc, char** argv) {
   std::string final_dir, assets, prompt_file, out_file = "engine_out.json",
-              weight_cache, model_path, dump_logits;
+              weight_cache, model_path, dump_logits, ple_table;
   int threads = 32, steps = 64, max_new = 256, attn_threads = 8;
+  int kv_bits = 3;
+  bool window_kv = false;
+  int global_memo = 0;
   bool tq_mode = true, teacher_force = false, free_run = false, window_check = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -622,6 +877,12 @@ int main(int argc, char** argv) {
     else if (a == "--out") out_file = next();
     else if (a == "--threads") threads = atoi(next().c_str());
     else if (a == "--attn-threads") attn_threads = atoi(next().c_str());
+    else if (a == "--global-memo") {
+      std::string v = next();
+      global_memo = v == "fp16" ? 1 : v == "stream" ? 2 : 0;
+      if (v != "full" && v != "fp16" && v != "stream")
+        DIE("--global-memo full|fp16|stream");
+    }
     else if (a == "--steps") steps = atoi(next().c_str());
     else if (a == "--max-new") max_new = atoi(next().c_str());
     else if (a == "--mode") tq_mode = next() == "tq";
@@ -629,6 +890,14 @@ int main(int argc, char** argv) {
     else if (a == "--free") free_run = true;
     else if (a == "--window-check") window_check = true;
     else if (a == "--weight-cache") weight_cache = next();
+    else if (a == "--ple-table") ple_table = next();
+    else if (a == "--cache-len") kCacheLen = atoi(next().c_str());
+    else if (a == "--kv-bits") kv_bits = atoi(next().c_str());
+    else if (a == "--window-kv") window_kv = atoi(next().c_str()) != 0;
+    else if (a == "--layers") kNumLayers = atoi(next().c_str());
+    else if (a == "--window") kWindow = atoi(next().c_str());
+    else if (a == "--global-every") kGlobalEvery = atoi(next().c_str());
+    else if (a == "--global-dim") kGlobalDim = atoi(next().c_str());
     else DIE("unknown arg %s", a.c_str());
   }
   if (final_dir.empty() || assets.empty() || prompt_file.empty())
@@ -647,7 +916,12 @@ int main(int argc, char** argv) {
   Engine eng;
   double t0 = now_s();
   eng.attn_threads = attn_threads;
+  eng.global_memo = global_memo;
+  eng.ple_table = ple_table;
+  eng.kv_bits = kv_bits;
+  kWindowKv = window_kv;
   eng.init(model_path, final_dir, assets, threads, weight_cache, tq_mode);
+  drop_model_page_cache();
   rss_mb(&rss, &hwm);
   fprintf(stderr, "loaded in %.1fs rss=%ld MB hwm=%ld MB packed_side_cache=%.1f MB\n",
           now_s() - t0, rss, hwm, eng.packed_bytes() / 1048576.0);
@@ -659,6 +933,7 @@ int main(int argc, char** argv) {
   double tp0 = now_s();
   for (int c = 0; c < m; c += kPrefill) {
     eng.prefill(ids.data() + c, c);
+    maybe_trim();
     fprintf(stderr, "prefill @%d\n", c);
   }
   double prefill_s = now_s() - tp0;
@@ -675,6 +950,7 @@ int main(int argc, char** argv) {
   int cur = -1;
   for (int i = m; i < n; ++i) {
     cur = eng.decode(ids[i], i, true, dumpc ? cl.data() : nullptr);
+    maybe_trim();
     if (dumpc) fwrite(cl.data(), 4, cl.size(), dumpc);
   }
   if (dumpc) fclose(dumpc);
@@ -733,6 +1009,7 @@ int main(int argc, char** argv) {
     for (int e : eos) if (feed == e) stop = true;
     if (stop) break;
     cur = eng.decode(feed, pos, true, dumpf ? logits_buf.data() : nullptr);
+    maybe_trim();
     if (dumpf) fwrite(logits_buf.data(), 4, logits_buf.size(), dumpf);
     ++pos;
   }
@@ -755,6 +1032,8 @@ int main(int argc, char** argv) {
           compared ? (double)agree / compared : -1, diverge, compared);
   fprintf(f, " \"prefill_s\": %.3f, \"prefill_tok_s\": %.2f, \"catchup_tok_s\": %.3f,\n",
           prefill_s, m / (prefill_s + 1e-9), catchup_toks / (catchup_s + 1e-9));
+  fprintf(f, " \"peak_rss_kb\": %ld, \"peak_file_kb\": %ld, \"trim_every\": %d,\n",
+          g_peak_rss_kb, g_peak_file_kb, g_trim_every);
   fprintf(f, " \"decode_s\": %.3f, \"decode_tok_s\": %.3f, \"n_gen\": %zu,\n",
           gen_s, (gen.size() - 1) / (gen_s + 1e-9), gen.size());
   fprintf(f, " \"t_model\": %.2f, \"t_quant\": %.3f, \"t_dequant\": %.3f, \"t_glue\": %.2f,\n",
