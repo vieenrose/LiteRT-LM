@@ -54,7 +54,7 @@ Same prompt (a 2,881-token reading prompt), `maxNumTokens` 4096, warm runs (the 
 
 | Reno7, CPU, 4k | LiteRT-LM 0.17.1 | **mfa_engine + fused graph** |
 |---|---|---|
-| E2B peak RSS | 2.28 GB | **1.26 GB** (anonymous 0.25 GB) |
+| E2B peak RSS | 2.28 GB | **1.08 GB** (1.26 GB before the table release) |
 | E2B prefill / decode | 118 / ~9.8 tok/s | **130 / 7.6–9.3 tok/s** |
 | E4B peak RSS | 4.58 GB | **2.65 GB** (anonymous 0.40 GB; 2.97 GB before the table release) |
 | E4B prefill / decode | 41 / ~4 tok/s | **43 / 4.1 tok/s** |
@@ -63,6 +63,8 @@ Same prompt (a 2,881-token reading prompt), `maxNumTokens` 4096, warm runs (the 
 E4B, the first 30+ tokens compared). The x86 host shows the same picture. E2B: anonymous memory
 0.94 → 0.24 GB, prefill 1,199 → 1,556 tok/s. E4B: anonymous memory 1.90 → 0.36 GB, prefill
 603 → 623 tok/s, decode 14.9 → 16.0 tok/s.
+
+**Context length.** Reno7, CPU, forked engine, peak RSS / prefill / decode: E2B 4k 1.08 GB / 118 / 8.6 tok/s; E2B 8k 1.16 GB / 90 / 6.4; E4B 4k 2.65 GB / 43 / 4.1; E4B 8k 2.82 GB / 38 / 3.3. On 13 held-out meetings the 8k context improves only decision recall (E4B 73 → 80 %), so 4k is recommended.
 
 **First run.** When the weight cache file does not exist, the engine first builds it in a
 compile-only pass. XNNPACK writes each packed step to the file and maps it back, while the original
