@@ -56,7 +56,7 @@ Same prompt (a 2,881-token reading prompt), `maxNumTokens` 4096, warm runs (the 
 |---|---|---|
 | E2B peak RSS | 2.28 GB | **1.26 GB** (anonymous 0.25 GB) |
 | E2B prefill / decode | 118 / ~9.8 tok/s | **130 / 7.6–9.3 tok/s** |
-| E4B peak RSS | 4.58 GB | **2.97 GB** (anonymous 0.40 GB) |
+| E4B peak RSS | 4.58 GB | **2.65 GB** (anonymous 0.40 GB; 2.97 GB before the table release) |
 | E4B prefill / decode | 41 / ~4 tok/s | **43 / 4.1 tok/s** |
 
 **Output.** Greedy tokens are identical to the unfused graph run by the same engine on x86 (E2B and
@@ -72,6 +72,8 @@ its shared mapping; the data stays in the file). The pass then unmaps everything
 warm. Reno7, cold start: E4B peak RSS 4.54 → **3.01 GB** (the pass itself peaks at 2.66 GB), E2B
 1.48 GB. The cache is byte-identical to one built the old way, and so are the output tokens, so
 nothing needs to be shipped pre-built.
+
+**Table release.** The embedder and per-layer-embedder tables are lookup tables whose touched pages stay resident (0.24 GB after one 3k-token prompt for E4B, growing with the vocabulary seen). Every 8 tokens the engine `MADV_DONTNEED`s their mappings, only those with `Private_Dirty = 0` in `smaps`; lookups read the page cache again. Reno7, E4B: `VmHWM` 2,821 → 2,586 MB, `dumpsys` RSS peak 2.65 GB, identical tokens, same speed. `MFA_KEEP_TABLES=1` disables it.
 
 ## Build
 
