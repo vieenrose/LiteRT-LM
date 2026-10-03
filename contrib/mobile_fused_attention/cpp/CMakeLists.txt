@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.16)
+project(mfa_engine CXX)
+# Standalone build against the stock prebuilt libLiteRt.so and the LiteRT C headers.
+#   cmake .. -DLITERT_INCLUDE=<dir containing litert/c/...> -DLITERT_LIB=<path>/libLiteRt.so
+set(CMAKE_CXX_STANDARD 17)
+set(LITERT_INCLUDE "" CACHE PATH "directory that contains litert/c/*.h")
+set(LITERT_LIB "" CACHE FILEPATH "prebuilt libLiteRt.so")
+set(MFA_MARCH "native" CACHE STRING "-march value (armv8.2-a+dotprod on recent phones)")
+find_package(OpenMP REQUIRED)
+add_executable(mfa_engine mfa_engine.cc i8_attn.cc)
+target_include_directories(mfa_engine PRIVATE ${LITERT_INCLUDE})
+target_compile_options(mfa_engine PRIVATE -O3 -march=${MFA_MARCH})
+target_link_libraries(mfa_engine PRIVATE ${LITERT_LIB} OpenMP::OpenMP_CXX)
+if(ANDROID)
+  target_link_options(mfa_engine PRIVATE -static-openmp)
+endif()
