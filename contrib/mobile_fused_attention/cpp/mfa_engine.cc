@@ -202,6 +202,34 @@ static void drop_mapped_pages(const std::string& path) {
   fclose(f);
 }
 
+// The embedder and per-layer-embedder tables are lookup tables: a token reads a few rows, but the
+// pages read stay resident (the PLE table is 0.84 GB for E4B; 0.24 GB were resident after one
+// 3k-token prompt, more as the vocabulary seen grows). Their mappings are clean and read-only, so
+// dropping them loses nothing: a later lookup reads the page back from the page cache.
+struct Range { void* a; size_t n; };
+static std::vector<Range> clean_ranges(const std::string& path) {
+  std::vector<Range> out;
+  char want[4096];
+  if (!realpath(path.c_str(), want)) return out;
+  FILE* f = fopen("/proc/self/smaps", "r");
+  if (!f) return out;
+  char line[4608];
+  Range cur{nullptr, 0}; bool match = false;
+  while (fgets(line, sizeof line, f)) {
+    unsigned long a, b; char perms[8]; int off = 0;
+    if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %n", &a, &b, perms, &off) >= 3 && off) {
+      char* name = line + off; name[strcspn(name, "\n")] = 0;
+      match = perms[0] == 'r' && perms[3] == 'p' && !strcmp(name, want);   // private: pages never written stay clean
+      cur = {(void*)a, (size_t)(b - a)};
+    } else if (match && !strncmp(line, "Private_Dirty:", 14) && atol(line + 14) == 0) {
+      out.push_back(cur);   // nothing written into this mapping: dropping it loses nothing
+    }
+  }
+  fclose(f);
+  return out;
+}
+static void drop_ranges(const std::vector<Range>& rs) { for (auto& r : rs) madvise(r.a, r.n, MADV_DONTNEED); }
+
 static void build_weight_cache(LiteRtEnvironment env, const std::string& path, int threads,
                                const std::string& cache, bool fused, int attn_threads) {
   double t0 = now_s();
@@ -304,8 +332,13 @@ int main(int argc, char** argv) {
   Sig& es = emb.sig("embedder"); Sig& ps = ple.sig("per_layer_embedder");
   const size_t hid = bytes_of(es.out[0]) / 4, ple_n = bytes_of(ps.out[0]) / 4;
   double t_embed = 0, t_main = 0;
+  std::vector<Range> tables = clean_ranges(dir + "/Section2_TFLiteModel_tf_lite_embedder.tflite");
+  for (auto& r : clean_ranges(dir + "/Section3_TFLiteModel_tf_lite_per_layer_embedder.tflite")) tables.push_back(r);
+  const bool drop_tables = !getenv("MFA_KEEP_TABLES");
+  int n_embed = 0;
   auto embed = [&](int tok, float* e, float* pl) {
     const double t = now_s();
+    if (drop_tables && (++n_embed & 7) == 0) drop_ranges(tables);
     *(int32_t*)lockw(es.in[0]) = tok; unlock(es.in[0]); emb.run(es);
     memcpy(e, lockr(es.out[0]), hid * 4); unlock(es.out[0]);
     *(int32_t*)lockw(ps.in[0]) = tok; unlock(ps.in[0]); ple.run(ps);
