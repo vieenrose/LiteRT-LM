@@ -14,6 +14,7 @@
 // Usage: mfa_engine --dir <litert-lm unpack dir> [--main fused.tflite] [--fused] --ctx 4096
 //                   --threads 8 [--weight-cache f] --ids prompt_ids.txt --max-new 400
 //                   [--stop 106,1] [--out gen_ids.txt]
+//        mfa_engine ... --serve      (line protocol on stdin/stdout, see below; stats on stderr)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,13 +23,19 @@
 #include <execinfo.h>
 #endif
 #include <signal.h>
+#include <poll.h>
+#include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#include <atomic>
+#include <thread>
+
 #include <algorithm>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -174,6 +181,60 @@ struct Model {
   }
 };
 
+// First run: XNNPACK packs every weight into the cache file and maps each finished step back
+// (MAP_SHARED), while the original weights it has read stay resident. Both together made the cold
+// E4B peak 4.5 GB on a Reno7 (anonymous memory 0.58 GB). So the cache is built by a compile-only
+// pass, during which a thread drops the cache's pages from this process (they are clean or in the
+// page cache, so nothing is lost); the pass then unmaps everything and the engine loads warm.
+// The model's own mapping is left alone: it is private and holds the rewritten magic numbers.
+static void drop_mapped_pages(const std::string& path) {
+  char want[4096];
+  if (!realpath(path.c_str(), want)) return;
+  FILE* f = fopen("/proc/self/maps", "r");
+  if (!f) return;
+  char line[4608];
+  while (fgets(line, sizeof line, f)) {
+    unsigned long a, b; char perms[8]; int off = 0;
+    if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %n", &a, &b, perms, &off) < 3 || !off) continue;
+    char* name = line + off; name[strcspn(name, "\n")] = 0;
+    if (perms[3] == 's' && !strcmp(name, want)) madvise((void*)a, b - a, MADV_DONTNEED);
+  }
+  fclose(f);
+}
+
+static void build_weight_cache(LiteRtEnvironment env, const std::string& path, int threads,
+                               const std::string& cache, bool fused, int attn_threads) {
+  double t0 = now_s();
+  std::atomic<bool> done{false};
+  std::thread reclaim([&] {
+    while (!done) { drop_mapped_pages(cache); usleep(200 * 1000); }
+  });
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) DIE("cannot open %s", path.c_str());
+  struct stat st; fstat(fd, &st);
+  void* p = mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (p == MAP_FAILED) DIE("mmap %s", path.c_str());
+  LiteRtModel model; ENSURE(LiteRtCreateModelFromBuffer(env, p, st.st_size, &model));
+  LiteRtOptions opts; ENSURE(LiteRtCreateOptions(&opts));
+  ENSURE(LiteRtSetOptionsHardwareAccelerators(opts, kLiteRtHwAcceleratorCpu));
+  if (LiteRtOpaqueOptions oo = cpu_options(threads, cache)) ENSURE(LiteRtAddOpaqueOptions(opts, oo));
+  if (fused) {
+    LiteRtCustomOpKernel k; void* ud = nullptr;
+    i8_attn_kernel(attn_threads > 0 ? attn_threads : threads, &k, &ud);
+    ENSURE(LiteRtAddCustomOpKernelOption(opts, "voxsum.i8_attention", 1, &k, ud));
+  }
+  LiteRtCompiledModel cm; ENSURE(LiteRtCreateCompiledModel(env, model, opts, &cm));
+  sample_mem();
+  LiteRtDestroyCompiledModel(cm);
+  LiteRtDestroyOptions(opts);
+  LiteRtDestroyModel(model);
+  done = true; reclaim.join();
+  munmap(p, st.st_size);
+  fprintf(stderr, "built weight cache %s in %.1fs, VmHWM %ld MB, VmRSS now %ld MB\n", cache.c_str(),
+          now_s() - t0, status_kb("VmHWM:") / 1024, status_kb("VmRSS:") / 1024);
+}
+
 static void* lockw(LiteRtTensorBuffer b) { void* p; ENSURE(LiteRtLockTensorBuffer(b, &p, kLiteRtTensorBufferLockModeWrite)); return p; }
 static const void* lockr(LiteRtTensorBuffer b) { void* p; ENSURE(LiteRtLockTensorBuffer(b, &p, kLiteRtTensorBufferLockModeRead)); return p; }
 static void unlock(LiteRtTensorBuffer b) { LiteRtUnlockTensorBuffer(b); }
@@ -196,8 +257,8 @@ int main(int argc, char** argv) {
   setenv("OMP_WAIT_POLICY", "PASSIVE", 0);
   std::string dir, main_path, cache, ids_path, out_path;
   int ctx = 4096, threads = 8, max_new = 400, attn_threads = 0;
-  bool fused = false;
-  std::vector<int> stop = {106, 1};
+  bool fused = false, serve = false;
+  std::vector<int> stop = {106, 1, 50};   // the stop tokens of the model metadata
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() { if (i + 1 >= argc) DIE("missing value for %s", a.c_str()); return std::string(argv[++i]); };
@@ -211,16 +272,12 @@ int main(int argc, char** argv) {
     else if (a == "--attn-threads") attn_threads = atoi(next().c_str());
     else if (a == "--max-new") max_new = atoi(next().c_str());
     else if (a == "--fused") fused = true;
+    else if (a == "--serve") serve = true;
     else if (a == "--stop") { stop.clear(); std::string s = next(); for (char* t = strtok(&s[0], ","); t; t = strtok(nullptr, ",")) stop.push_back(atoi(t)); }
     else DIE("unknown argument %s", a.c_str());
   }
-  if (dir.empty() || ids_path.empty()) DIE("--dir and --ids are required");
+  if (dir.empty() || (ids_path.empty() && !serve)) DIE("--dir and --ids (or --serve) are required");
   if (main_path.empty()) main_path = dir + "/Section10_TFLiteModel_tf_lite_prefill_decode.tflite";
-  std::vector<int> ids;
-  { FILE* f = fopen(ids_path.c_str(), "r"); if (!f) DIE("cannot open %s", ids_path.c_str());
-    int v; while (fscanf(f, "%d", &v) == 1) ids.push_back(v); fclose(f); }
-  if (ids.size() < 2) DIE("need at least 2 prompt tokens");
-
   // the cache length: 32003 in the graph, replaced at load
   std::vector<char> mn(sizeof(LiteRtMagicNumberConfigs) + sizeof(LiteRtMagicNumberConfig));
   auto* cfg = reinterpret_cast<LiteRtMagicNumberConfigs*>(mn.data());
@@ -236,6 +293,9 @@ int main(int argc, char** argv) {
   std::map<std::string, LiteRtTensorBuffer> kv;
   Model emb(env, dir + "/Section2_TFLiteModel_tf_lite_embedder.tflite", threads, "", false, nullptr, {});
   Model ple(env, dir + "/Section3_TFLiteModel_tf_lite_per_layer_embedder.tflite", threads, "", false, nullptr, {});
+  struct stat cst;
+  if (!cache.empty() && (stat(cache.c_str(), &cst) != 0 || cst.st_size == 0))
+    build_weight_cache(env, main_path, threads, cache, fused, attn_threads);
   Model lm(env, main_path, threads, cache, fused, &kv, {"prefill_128", "decode"}, attn_threads);
   sample_mem();
   fprintf(stderr, "load %.1fs, %zu kv buffers, VmHWM %ld MB RssAnon %ld MB\n", now_s() - t0, kv.size(),
@@ -268,40 +328,39 @@ int main(int argc, char** argv) {
   const size_t C = bytes_of(pf.in[iM]) / T;
   fprintf(stderr, "cache length %zu (requested %d)\n", C, ctx);
 
-  // prefill all prompt tokens but the last
-  const int n_prompt = (int)ids.size() - 1;
-  std::vector<float> e(hid), pl(ple_n);
-  double tp = now_s();
-  for (int start = 0; start < n_prompt; start += T) {
-    const int n = std::min(T, n_prompt - start);
-    float* E = (float*)lockw(pf.in[iE]); float* P = (float*)lockw(pf.in[iP]);
-    memset(E, 0, bytes_of(pf.in[iE])); memset(P, 0, bytes_of(pf.in[iP]));
-    for (int t = 0; t < n; ++t) {
-      embed(ids[start + t], e.data(), pl.data());
-      memcpy(E + (size_t)t * hid, e.data(), hid * 4); memcpy(P + (size_t)t * ple_n, pl.data(), ple_n * 4);
-    }
-    unlock(pf.in[iE]); unlock(pf.in[iP]);
-    int32_t* pos = (int32_t*)lockw(pf.in[iPos]); memset(pos, 0, T * 4);
-    for (int t = 0; t < n; ++t) pos[t] = start + t;
-    unlock(pf.in[iPos]);
-    uint8_t* M = (uint8_t*)lockw(pf.in[iM]); memset(M, 0, (size_t)T * C);
-    for (int t = 0; t < n; ++t) memset(M + (size_t)t * C, 1, std::min<size_t>(start + t + 1, C));
-    unlock(pf.in[iM]);
-    int32_t* par = (int32_t*)lockw(pf.in[iPar]); memset(par, 0, bytes_of(pf.in[iPar]));
-    par[0] = start; par[1] = start + n; par[2] = start + n; unlock(pf.in[iPar]);
-    { const double t = now_s(); lm.run(pf); t_main += now_s() - t; }
-    sample_mem();
-  }
-  const double prefill_s = now_s() - tp;
-
   const int dE = dc.in_idx("embeddings"), dP = dc.in_idx("per_layer_embeddings"), dPos = dc.in_idx("input_pos"),
             dM = dc.in_idx("mask"), dPar = dc.in_idx("param_tensor"), dL = dc.out_idx("logits");
   if (dE < 0 || dP < 0 || dPos < 0 || dM < 0 || dPar < 0 || dL < 0) DIE("decode signature names not found");
   const size_t vocab = bytes_of(dc.out[dL]) / 4;
-  std::vector<int> gen;
-  int tok = ids.back(), pos = n_prompt;
-  double td = now_s();
-  for (int step = 0; step < max_new && pos < (int)C; ++step, ++pos) {
+  std::vector<float> e(hid), pl(ple_n);
+  std::vector<int> fed;   // tokens whose keys and values are in the cache, by position
+
+  // Prefill ids[from, to) at positions from.. (the cache already holds positions < from).
+  auto prefill = [&](const std::vector<int>& ids, int from, int to) {
+    for (int start = from; start < to; start += T) {
+      const int n = std::min(T, to - start);
+      float* E = (float*)lockw(pf.in[iE]); float* P = (float*)lockw(pf.in[iP]);
+      memset(E, 0, bytes_of(pf.in[iE])); memset(P, 0, bytes_of(pf.in[iP]));
+      for (int t = 0; t < n; ++t) {
+        embed(ids[start + t], e.data(), pl.data());
+        memcpy(E + (size_t)t * hid, e.data(), hid * 4); memcpy(P + (size_t)t * ple_n, pl.data(), ple_n * 4);
+      }
+      unlock(pf.in[iE]); unlock(pf.in[iP]);
+      int32_t* pos = (int32_t*)lockw(pf.in[iPos]); memset(pos, 0, T * 4);
+      for (int t = 0; t < n; ++t) pos[t] = start + t;
+      unlock(pf.in[iPos]);
+      uint8_t* M = (uint8_t*)lockw(pf.in[iM]); memset(M, 0, (size_t)T * C);
+      for (int t = 0; t < n; ++t) memset(M + (size_t)t * C, 1, std::min<size_t>(start + t + 1, C));
+      unlock(pf.in[iM]);
+      int32_t* par = (int32_t*)lockw(pf.in[iPar]); memset(par, 0, bytes_of(pf.in[iPar]));
+      par[0] = start; par[1] = start + n; par[2] = start + n; unlock(pf.in[iPar]);
+      { const double t = now_s(); lm.run(pf); t_main += now_s() - t; }
+      sample_mem();
+    }
+    fed.assign(ids.begin(), ids.begin() + to);
+  };
+  // Feed `tok` at position `pos`; return the logits of the next token.
+  auto step = [&](int tok, int pos) -> const float* {
     embed(tok, e.data(), pl.data());
     memcpy(lockw(dc.in[dE]), e.data(), hid * 4); unlock(dc.in[dE]);
     memcpy(lockw(dc.in[dP]), pl.data(), ple_n * 4); unlock(dc.in[dP]);
@@ -310,10 +369,86 @@ int main(int argc, char** argv) {
     int32_t* par = (int32_t*)lockw(dc.in[dPar]); memset(par, 0, bytes_of(dc.in[dPar]));
     par[0] = pos; par[1] = pos + 1; par[2] = pos + 1; unlock(dc.in[dPar]);
     { const double t = now_s(); lm.run(dc); t_main += now_s() - t; }
-    const float* L = (const float*)lockr(dc.out[dL]);
-    tok = (int)(std::max_element(L, L + vocab) - L);
-    unlock(dc.out[dL]);
+    fed.resize(pos); fed.push_back(tok);
     sample_mem();
+    const float* L = (const float*)lockr(dc.out[dL]);
+    unlock(dc.out[dL]);   // host memory: the pointer stays valid until the next run
+    return L;
+  };
+  std::vector<std::pair<float, int>> cand;
+  auto sample = [&](const float* L, float temp, int top_k, float top_p, std::mt19937& rng) -> int {
+    if (temp <= 0.f || top_k == 1) return (int)(std::max_element(L, L + vocab) - L);
+    const int k = std::min<int>(top_k > 0 ? top_k : 64, (int)vocab);
+    cand.resize(vocab);
+    for (size_t i = 0; i < vocab; ++i) cand[i] = {L[i], (int)i};
+    std::partial_sort(cand.begin(), cand.begin() + k, cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    double sum = 0; std::vector<double> p(k);
+    for (int i = 0; i < k; ++i) sum += p[i] = exp((cand[i].first - cand[0].first) / temp);
+    int keep = k; double acc = 0;
+    for (int i = 0; i < k; ++i) { acc += p[i] / sum; if (acc >= top_p) { keep = i + 1; break; } }
+    double tot = 0; for (int i = 0; i < keep; ++i) tot += p[i];
+    double r = std::uniform_real_distribution<double>(0, tot)(rng);
+    for (int i = 0; i < keep; ++i) { r -= p[i]; if (r <= 0) return cand[i].second; }
+    return cand[keep - 1].second;
+  };
+
+  if (serve) {
+    // Line protocol on stdin/stdout, one request at a time:
+    //   request : R <max_new> <temp> <top_k> <top_p> <seed> <n> <id_1> ... <id_n>
+    //   reply   : T <id> per generated token, then D <reason> <prefilled> <reused> <prefill_s> <decode_s>
+    //             (reason: stop | length | cancel | ctx); E <message> on a bad request.
+    //   A line C sent while tokens stream cancels the generation (stop strings are checked by the caller).
+    // The prompt reuses the longest prefix already in the cache.
+    fprintf(stdout, "READY %zu\n", C); fflush(stdout);
+    std::string line;
+    char* buf = nullptr; size_t cap = 0;
+    while (getline(&buf, &cap, stdin) > 0) {
+      if (buf[0] != 'R') continue;
+      std::vector<int> ids; int max_new, top_k, n; float temp, top_p; unsigned seed;
+      char* p = buf + 1;
+      max_new = strtol(p, &p, 10); temp = strtof(p, &p); top_k = strtol(p, &p, 10);
+      top_p = strtof(p, &p); seed = strtoul(p, &p, 10); n = strtol(p, &p, 10);
+      for (int i = 0; i < n; ++i) ids.push_back(strtol(p, &p, 10));
+      if (n < 1 || n >= (int)C) { fprintf(stdout, "E prompt of %d tokens, cache %zu\n", n, C); fflush(stdout); continue; }
+      int reuse = 0;
+      while (reuse < (int)fed.size() && reuse < n - 1 && fed[reuse] == ids[reuse]) ++reuse;
+      const double t0p = now_s();
+      prefill(ids, reuse, n - 1);
+      const double prefill_s = now_s() - t0p, t0d = now_s();
+      std::mt19937 rng(seed);
+      int tok = ids.back(), pos = n - 1, ngen = 0;
+      const char* reason = "length";
+      for (; ngen < max_new; ++ngen, ++pos) {
+        if (pos >= (int)C) { reason = "ctx"; break; }
+        tok = sample(step(tok, pos), temp, top_k, top_p, rng);
+        fprintf(stdout, "T %d\n", tok); fflush(stdout);
+        if (std::find(stop.begin(), stop.end(), tok) != stop.end()) { reason = "stop"; ++ngen; break; }
+        pollfd pfd{0, POLLIN, 0};
+        if (poll(&pfd, 1, 0) > 0) {   // a cancel line
+          if (getline(&buf, &cap, stdin) > 0 && buf[0] == 'C') { reason = "cancel"; ++ngen; break; }
+        }
+      }
+      fprintf(stdout, "D %s %d %d %.3f %.3f\n", reason, n - 1 - reuse, reuse, prefill_s, now_s() - t0d);
+      fflush(stdout);
+    }
+    return 0;
+  }
+
+  std::vector<int> ids;
+  { FILE* f = fopen(ids_path.c_str(), "r"); if (!f) DIE("cannot open %s", ids_path.c_str());
+    int v; while (fscanf(f, "%d", &v) == 1) ids.push_back(v); fclose(f); }
+  if (ids.size() < 2) DIE("need at least 2 prompt tokens");
+  // prefill all prompt tokens but the last; the first decode step feeds it
+  const int n_prompt = (int)ids.size() - 1;
+  double tp = now_s();
+  prefill(ids, 0, n_prompt);
+  const double prefill_s = now_s() - tp;
+  std::vector<int> gen;
+  int tok = ids.back(), pos = n_prompt;
+  double td = now_s();
+  for (int s = 0; s < max_new && pos < (int)C; ++s, ++pos) {
+    const float* L = step(tok, pos);
+    tok = (int)(std::max_element(L, L + vocab) - L);
     gen.push_back(tok);
     if (std::find(stop.begin(), stop.end(), tok) != stop.end()) break;
   }

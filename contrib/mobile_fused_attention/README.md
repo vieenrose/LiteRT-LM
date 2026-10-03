@@ -28,7 +28,8 @@ quantization (TurboQuant) would not help here. The GPU path (ML Drift) has nativ
 2. **Kernel** (`cpp/i8_attn.cc`). It reads the int8 cache on the live columns only (mask true and
    column < `param[2]`), converted to float once per call. Q·Kᵀ and P·Vᵀ run as 4×4 NEON dot-product
    tiles, the softmax normalizer is accumulated in double, and nothing is allocated at the size of the
-   cache squared. It uses 8 threads for prefill and 2 for decode. `KMP_BLOCKTIME=0` keeps its OpenMP
+   cache squared. The dot products are summed in float over blocks of 64 and the blocks in double: with
+   a plain float sum over 4k columns, E4B's greedy output left the unfused graph's at token 44. It uses 8 threads for prefill and 2 for decode. `KMP_BLOCKTIME=0` keeps its OpenMP
    threads from spinning against XNNPACK's pool: prefill went from 80 to 130 tok/s on the Reno7 with it.
 3. **Engine** (`cpp/mfa_engine.cc`). A standalone CPU driver on the stock `libLiteRt.so` (the
    `com.google.ai.edge.litert:litert:2.1.6` AAR that VoxSumDroid already ships). It reproduces
@@ -40,7 +41,12 @@ quantization (TurboQuant) would not help here. The GPU path (ML Drift) has nativ
    - **Prefill.** `prefill_128` gets a causal bool mask and `param_tensor = [start, end, end]`.
    - **KV cache.** The 30 (E2B) or 48 (E4B) int8 KV buffers are shared between signatures and updated
      in place.
-   - **Decoding** is greedy, and the XNNPACK weight cache is a file.
+   - **Decoding** is greedy or sampled (temperature, top-k, top-p, seed), and the XNNPACK weight cache
+     is a file.
+   - **Server mode** (`--serve`): a line protocol on stdin/stdout keeps the engine resident and reuses
+     the longest common prefix of the KV cache between requests. `python/serve_openai.py` wraps it as
+     an OpenAI-compatible `/v1/chat/completions` server (chat template from the `.litertlm` metadata,
+     HF tokenizer, stop strings, llama-server-style `timings`), one engine process per slot.
 
 ## Results
 
@@ -58,8 +64,14 @@ E4B, the first 30+ tokens compared). The x86 host shows the same picture. E2B: a
 0.94 → 0.24 GB, prefill 1,199 → 1,556 tok/s. E4B: anonymous memory 1.90 → 0.36 GB, prefill
 603 → 623 tok/s, decode 14.9 → 16.0 tok/s.
 
-**First run.** The first run builds the XNNPACK weight cache and peaks higher (E4B: 4.3 GB). Build
-the cache once per library build and CPU class and ship it, as in `vieenrose/LiteRT` turboquant-tq3.
+**First run.** When the weight cache file does not exist, the engine first builds it in a
+compile-only pass. XNNPACK writes each packed step to the file and maps it back, while the original
+weights it has read stay resident; the two together peaked at 4.5 GB for E4B (anonymous memory only
+0.58 GB). During the pass a thread drops the cache file's pages from the process (`MADV_DONTNEED` on
+its shared mapping; the data stays in the file). The pass then unmaps everything and the engine loads
+warm. Reno7, cold start: E4B peak RSS 4.54 → **3.01 GB** (the pass itself peaks at 2.66 GB), E2B
+1.48 GB. The cache is byte-identical to one built the old way, and so are the output tokens, so
+nothing needs to be shipped pre-built.
 
 ## Build
 
@@ -82,6 +94,6 @@ make
 ## Limits
 
 - CPU only. The GPU path keeps Google's graph, so use the unfused file there.
-- Greedy decoding, and the tokenizer is outside the engine (the app supplies token ids).
+- The tokenizer is outside the engine (the app supplies token ids; `serve_openai.py` uses the HF one).
 - The engine is a driver, not a library yet. The VoxSumDroid integration should follow
   `mosslite/moss_lite_engine.cc`: a resident engine and a JNI surface.

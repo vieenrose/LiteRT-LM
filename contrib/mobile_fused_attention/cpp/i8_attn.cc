@@ -18,7 +18,8 @@
 // whose exp underflows to 0). Sums and the output are accumulated in double: the next layers
 // quantize their input on static int8 ranges, and a reimplemented attention must stay close
 // to the reference for the argmax to agree (lesson of vieenrose/LiteRT turboquant-tq3). The
-// dot products run in float (vectorized); the softmax normalizer is kept in double.
+// dot products run in float (vectorized) over chunks summed in double; the softmax normalizer is
+// kept in double.
 #include "i8_attn.h"
 
 #include <math.h>
@@ -42,20 +43,29 @@ namespace {
 
 // C[u][v] = sum_k A[u][k] * B[v][k] for a tile of mu <= 4 rows of A and nv <= 4 rows of B
 // (both row-major along k). Used for q.K^T and P.V^T, whose reduction dims are contiguous.
+// Partial sums run in float over chunks of KC elements and are added in double: a plain float
+// accumulation over a 4k-column P.V^T flips near-tied argmaxes of the next layers (measured on
+// E4B: greedy output differs from the unfused graph at token 44; chunked: identical).
+static constexpr int KC = 64;
 static inline void dot_tile(const float* A, size_t lda, int mu, const float* B, size_t ldb, int nv,
                             int k, float out[4][4]) {
+  double acc[4][4] = {};
 #if defined(__aarch64__)
   if (mu == 4 && nv == 4 && (k & 3) == 0) {
-    float32x4_t c[4][4];
-    for (int u = 0; u < 4; ++u) for (int v = 0; v < 4; ++v) c[u][v] = vdupq_n_f32(0.f);
-    for (int x = 0; x < k; x += 4) {
-      float32x4_t a[4], b[4];
-      for (int u = 0; u < 4; ++u) a[u] = vld1q_f32(A + u * lda + x);
-      for (int v = 0; v < 4; ++v) b[v] = vld1q_f32(B + v * ldb + x);
-      for (int u = 0; u < 4; ++u)
-        for (int v = 0; v < 4; ++v) c[u][v] = vfmaq_f32(c[u][v], a[u], b[v]);
+    for (int x0 = 0; x0 < k; x0 += KC) {
+      const int x1 = std::min(k, x0 + KC);
+      float32x4_t c[4][4];
+      for (int u = 0; u < 4; ++u) for (int v = 0; v < 4; ++v) c[u][v] = vdupq_n_f32(0.f);
+      for (int x = x0; x < x1; x += 4) {
+        float32x4_t a[4], b[4];
+        for (int u = 0; u < 4; ++u) a[u] = vld1q_f32(A + u * lda + x);
+        for (int v = 0; v < 4; ++v) b[v] = vld1q_f32(B + v * ldb + x);
+        for (int u = 0; u < 4; ++u)
+          for (int v = 0; v < 4; ++v) c[u][v] = vfmaq_f32(c[u][v], a[u], b[v]);
+      }
+      for (int u = 0; u < 4; ++u) for (int v = 0; v < 4; ++v) acc[u][v] += vaddvq_f32(c[u][v]);
     }
-    for (int u = 0; u < 4; ++u) for (int v = 0; v < 4; ++v) out[u][v] = vaddvq_f32(c[u][v]);
+    for (int u = 0; u < 4; ++u) for (int v = 0; v < 4; ++v) out[u][v] = (float)acc[u][v];
     return;
   }
 #endif
@@ -63,10 +73,14 @@ static inline void dot_tile(const float* A, size_t lda, int mu, const float* B, 
     for (int v = 0; v < nv; ++v) {
       const float* a = A + u * lda;
       const float* b = B + v * ldb;
-      float acc = 0.f;
-#pragma omp simd reduction(+ : acc)
-      for (int x = 0; x < k; ++x) acc += a[x] * b[x];
-      out[u][v] = acc;
+      for (int x0 = 0; x0 < k; x0 += KC) {
+        const int x1 = std::min(k, x0 + KC);
+        float part = 0.f;
+#pragma omp simd reduction(+ : part)
+        for (int x = x0; x < x1; ++x) part += a[x] * b[x];
+        acc[u][v] += part;
+      }
+      out[u][v] = (float)acc[u][v];
     }
 }
 
